@@ -1,0 +1,6 @@
+[package]
+name = "as5048b_magnetic_encoder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
