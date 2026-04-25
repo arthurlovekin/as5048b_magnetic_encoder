@@ -12,9 +12,8 @@ use embedded_hal::i2c::I2c;
 // ----- Register map (subset; see datasheet_i2c.md) -----
 const REG_PROGRAMMING_CONTROL: u8 = 0x03;
 const REG_I2C_ADDRESS: u8 = 0x15;
-// TODO: implement OTP zero-position programming via 0x16 / 0x17.
-// const REG_OTP_ZERO_HI: u8 = 0x16;
-// const REG_OTP_ZERO_LO: u8 = 0x17;
+const REG_OTP_ZERO_HI: u8 = 0x16;
+const REG_OTP_ZERO_LO: u8 = 0x17;
 const REG_DIAGNOSTICS: u8 = 0xFB;
 const REG_MAGNITUDE_MSB: u8 = 0xFC;
 const REG_ANGLE_MSB: u8 = 0xFE;
@@ -23,6 +22,11 @@ const REG_ANGLE_MSB: u8 = 0xFE;
 const OTP_CTRL_PROGRAMMING_MODE: u8 = 0xFD;
 const OTP_CTRL_BURN: u8 = 0x08;
 const OTP_CTRL_DISABLE: u8 = 0x00;
+
+// Programming-control bits used during the zero-position OTP burn sequence
+// (see datasheet `## Programming Control`).
+const OTP_CTRL_PROG_ENABLE: u8 = 0x01; // bit 0
+const OTP_CTRL_VERIFY: u8 = 0x40; // bit 6
 
 /// Default 7-bit I²C address with A1/A2 strapped low and an unprogrammed address.
 pub const DEFAULT_ADDRESS: u8 = 0x40;
@@ -79,6 +83,37 @@ pub enum ProgramError<E> {
     I2cWriteStep3(E),
     I2cWriteStep4(E),
     I2cPostVerify(E),
+}
+
+/// Errors from the OTP zero-position programming sequence.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ZeroPositionError<E> {
+    /// Failed to clear the zero-position registers (step 1).
+    I2cClear(E),
+    /// Failed to read the angle (steps 2, 6, 8).
+    I2cReadAngle(E),
+    /// Failed to write the live angle into the zero-position registers (step 3).
+    I2cWriteZeroPosition(E),
+    /// Failed to set Programming Enable (step 4).
+    I2cProgrammingEnable(E),
+    /// Failed to set Burn (step 5).
+    I2cBurn(E),
+    /// Failed to set Verify (step 7).
+    I2cVerify(E),
+}
+
+/// Diagnostic angle readings returned by [`As5048b::program_zero_position`].
+///
+/// The datasheet says both readings should be 0 after a successful burn; the
+/// driver returns the actual values so the caller can log or threshold them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ZeroPositionResult {
+    /// Raw angle read after the burn step (datasheet expects 0).
+    pub post_burn_angle_raw: u16,
+    /// Raw angle read after the verify-reload step (datasheet expects 0).
+    pub post_verify_angle_raw: u16,
 }
 
 /// AS5048B driver bound to a single 7-bit I²C address.
@@ -179,6 +214,82 @@ where
         // Post-verify on the new address.
         self.read_angle_raw().map_err(ProgramError::I2cPostVerify)?;
         Ok(())
+    }
+
+    /// Burn the current measured angle as the zero offset into OTP. **Irreversible.**
+    ///
+    /// Implements the datasheet's "Programming Sequence with Verification":
+    /// clear `0x16`/`0x17`, read the live (uncorrected) angle, write it back as
+    /// the zero offset, then Programming Enable → Burn → Verify reload. Place
+    /// the magnet at the desired mechanical zero before calling.
+    ///
+    /// On success the post-burn and post-verify angle readings are returned.
+    /// The datasheet expects both to read 0; threshold or log them as needed.
+    pub fn program_zero_position<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<ZeroPositionResult, ZeroPositionError<E>> {
+        // 1. Clear the zero-position registers so the next angle read is uncorrected.
+        self.i2c
+            .write(self.address, &[REG_OTP_ZERO_HI, 0x00])
+            .map_err(ZeroPositionError::I2cClear)?;
+        delay.delay_ms(2);
+        self.i2c
+            .write(self.address, &[REG_OTP_ZERO_LO, 0x00])
+            .map_err(ZeroPositionError::I2cClear)?;
+        delay.delay_ms(2);
+
+        // 2. Read the live angle (no zero correction now applied).
+        let angle = self
+            .read_angle_raw()
+            .map_err(ZeroPositionError::I2cReadAngle)?;
+
+        // 3. Write the live angle into the zero-position registers. Encoding
+        //    matches the angle-read decoding in `read_u14`: hi = bits 13..6,
+        //    lo = bits 5..0 (top 2 bits of the lo register are unused).
+        let hi = (angle >> 6) as u8;
+        let lo = (angle & 0x3F) as u8;
+        self.i2c
+            .write(self.address, &[REG_OTP_ZERO_HI, hi])
+            .map_err(ZeroPositionError::I2cWriteZeroPosition)?;
+        delay.delay_ms(2);
+        self.i2c
+            .write(self.address, &[REG_OTP_ZERO_LO, lo])
+            .map_err(ZeroPositionError::I2cWriteZeroPosition)?;
+        delay.delay_ms(2);
+
+        // 4. Programming Enable.
+        self.i2c
+            .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_PROG_ENABLE])
+            .map_err(ZeroPositionError::I2cProgrammingEnable)?;
+        delay.delay_ms(2);
+
+        // 5. Burn.
+        self.i2c
+            .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN])
+            .map_err(ZeroPositionError::I2cBurn)?;
+        delay.delay_ms(30);
+
+        // 6. Read angle (datasheet expects 0).
+        let post_burn_angle_raw = self
+            .read_angle_raw()
+            .map_err(ZeroPositionError::I2cReadAngle)?;
+
+        // 7. Verify — reload OTP into internal registers.
+        self.i2c
+            .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_VERIFY])
+            .map_err(ZeroPositionError::I2cVerify)?;
+        delay.delay_ms(2);
+
+        // 8. Read angle (datasheet expects 0).
+        let post_verify_angle_raw = self
+            .read_angle_raw()
+            .map_err(ZeroPositionError::I2cReadAngle)?;
+
+        Ok(ZeroPositionResult {
+            post_burn_angle_raw,
+            post_verify_angle_raw,
+        })
     }
 }
 
@@ -380,6 +491,81 @@ mod tests {
 
         dev.program_i2c_address(&mut delay, new).unwrap();
         assert_eq!(dev.address(), new);
+        i2c.done();
+    }
+
+    #[test]
+    fn program_zero_position_happy_path() {
+        // Pick a live angle and verify the encode matches the decode pattern.
+        let live_angle: u16 = (0xAA_u16 << 6) | 0x15; // 10901, fits in 14 bits.
+        let hi = (live_angle >> 6) as u8;
+        let lo = (live_angle & 0x3F) as u8;
+
+        let expectations = [
+            // 1. Clear zero-position registers.
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_HI, 0x00]),
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_LO, 0x00]),
+            // 2. Read the live (uncorrected) angle.
+            Transaction::write_read(DEFAULT_ADDRESS, vec![REG_ANGLE_MSB], vec![0xAA, 0x15]),
+            // 3. Write live angle back into zero-position registers.
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_HI, hi]),
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_LO, lo]),
+            // 4. Programming Enable.
+            Transaction::write(
+                DEFAULT_ADDRESS,
+                vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_PROG_ENABLE],
+            ),
+            // 5. Burn.
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN]),
+            // 6. Post-burn angle read (datasheet expects 0).
+            Transaction::write_read(DEFAULT_ADDRESS, vec![REG_ANGLE_MSB], vec![0x00, 0x00]),
+            // 7. Verify reload.
+            Transaction::write(
+                DEFAULT_ADDRESS,
+                vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_VERIFY],
+            ),
+            // 8. Post-verify angle read.
+            Transaction::write_read(DEFAULT_ADDRESS, vec![REG_ANGLE_MSB], vec![0x00, 0x00]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+        let mut delay = NoopDelay::new();
+        let mut dev = As5048b::new(&mut i2c, DEFAULT_ADDRESS);
+
+        let result = dev.program_zero_position(&mut delay).unwrap();
+        assert_eq!(result.post_burn_angle_raw, 0);
+        assert_eq!(result.post_verify_angle_raw, 0);
+        i2c.done();
+    }
+
+    #[test]
+    fn program_zero_position_returns_nonzero_post_readings() {
+        // If the magnet drifts during burn, post readings won't be exactly 0.
+        // The driver should surface them, not error.
+        let expectations = [
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_HI, 0x00]),
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_LO, 0x00]),
+            Transaction::write_read(DEFAULT_ADDRESS, vec![REG_ANGLE_MSB], vec![0x00, 0x05]),
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_HI, 0x00]),
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_LO, 0x05]),
+            Transaction::write(
+                DEFAULT_ADDRESS,
+                vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_PROG_ENABLE],
+            ),
+            Transaction::write(DEFAULT_ADDRESS, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN]),
+            Transaction::write_read(DEFAULT_ADDRESS, vec![REG_ANGLE_MSB], vec![0x00, 0x02]),
+            Transaction::write(
+                DEFAULT_ADDRESS,
+                vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_VERIFY],
+            ),
+            Transaction::write_read(DEFAULT_ADDRESS, vec![REG_ANGLE_MSB], vec![0x00, 0x03]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+        let mut delay = NoopDelay::new();
+        let mut dev = As5048b::new(&mut i2c, DEFAULT_ADDRESS);
+
+        let result = dev.program_zero_position(&mut delay).unwrap();
+        assert_eq!(result.post_burn_angle_raw, 2);
+        assert_eq!(result.post_verify_angle_raw, 3);
         i2c.done();
     }
 
