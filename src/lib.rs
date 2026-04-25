@@ -19,16 +19,16 @@ const REG_DIAGNOSTICS: u8 = 0xFB;
 const REG_MAGNITUDE_MSB: u8 = 0xFC;
 const REG_ANGLE_MSB: u8 = 0xFE;
 
-// Programming-control byte values used during the OTP burn sequence.
+// Programming-control byte values used during the I2C address OTP burn sequence.
 const OTP_CTRL_PROGRAMMING_MODE: u8 = 0xFD;
 const OTP_CTRL_BURN: u8 = 0x08;
 const OTP_CTRL_DISABLE: u8 = 0x00;
 
-/// Default 7-bit I²C address with A1/A2 strapped low and an unprogrammed OTP.
+/// Default 7-bit I²C address with A1/A2 strapped low and an unprogrammed address.
 pub const DEFAULT_ADDRESS: u8 = 0x40;
 
 /// Maximum raw value of the 14-bit angle / magnitude registers.
-pub const RAW_MAX: u16 = 16_383;
+pub const U14_RAW_MAX: u16 = 16_383; // 2^14 - 1
 
 /// Decoded diagnostic flags from register `0xFB`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +129,7 @@ where
         Ok(Diagnostics { raw: b[0] })
     }
 
-    /// Burn a new 7-bit I²C address into OTP. **Irreversible.**
+    /// Assign a new 7-bit I²C with a One-Time-Program (OTP). **Irreversible.**
     ///
     /// On success, `self.address()` returns `new_address`. After step 1 the
     /// chip already responds on `new_address`, so on later-step failure the
@@ -184,7 +184,7 @@ where
 
 /// Convert a raw 14-bit angle reading to degrees in `0.0..360.0`.
 pub fn raw_to_degrees(raw: u16) -> f32 {
-    (raw as f32) / (RAW_MAX as f32) * 360.0
+    (raw as f32) / (U14_RAW_MAX as f32) * 360.0
 }
 
 /// Compute the 5-bit OTP value for register `0x15` that produces the desired
@@ -236,9 +236,6 @@ mod tests {
         assert_eq!(otp_five_bits_for_7bit_address(0x4C), 0x03);
         assert_eq!(otp_five_bits_for_7bit_address(0x50), 0x04);
         assert_eq!(otp_five_bits_for_7bit_address(0x54), 0x05);
-        // Note: program.rs doc comment claims 0x58 -> 0x07, but the verified
-        // formula gives 0x06 (((0x58 >> 2) ^ 0x10) & 0x1F = 0x16 ^ 0x10 = 0x06),
-        // which matches the addresses successfully programmed on hardware.
         assert_eq!(otp_five_bits_for_7bit_address(0x58), 0x06);
     }
 
@@ -267,9 +264,9 @@ mod tests {
     #[test]
     fn raw_to_degrees_endpoints() {
         assert_eq!(raw_to_degrees(0), 0.0);
-        let max = raw_to_degrees(RAW_MAX);
+        let max = raw_to_degrees(U14_RAW_MAX);
         assert!((max - 360.0).abs() < 1e-3);
-        let mid = raw_to_degrees(RAW_MAX / 2);
+        let mid = raw_to_degrees(U14_RAW_MAX / 2);
         assert!((mid - 180.0).abs() < 0.05);
     }
 
