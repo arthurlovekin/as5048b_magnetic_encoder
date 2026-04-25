@@ -18,15 +18,14 @@ const REG_DIAGNOSTICS: u8 = 0xFB;
 const REG_MAGNITUDE_MSB: u8 = 0xFC;
 const REG_ANGLE_MSB: u8 = 0xFE;
 
-// Programming-control byte values used during the I2C address OTP burn sequence.
-const OTP_CTRL_PROGRAMMING_MODE: u8 = 0xFD;
-const OTP_CTRL_BURN: u8 = 0x08;
-const OTP_CTRL_DISABLE: u8 = 0x00;
-
-// Programming-control bits used during the zero-position OTP burn sequence
-// (see datasheet `## Programming Control`).
+// Programming-control bits
 const OTP_CTRL_PROG_ENABLE: u8 = 0x01; // bit 0
+const OTP_CTRL_BURN: u8 = 0x08; // bit 3
 const OTP_CTRL_VERIFY: u8 = 0x40; // bit 6
+const OTP_CTRL_DISABLE: u8 = 0x00; // all bits cleared
+
+// Byte used only by the I²C-address OTP procedure (AN386 application note)
+const OTP_CTRL_ADDRESS_PROGRAMMING_MODE: u8 = 0xFD;
 
 /// Default 7-bit I²C address with A1/A2 strapped low and an unprogrammed address.
 pub const DEFAULT_ADDRESS: u8 = 0x40;
@@ -68,7 +67,7 @@ impl Diagnostics {
 /// Errors from the OTP I²C-address programming sequence.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ProgramError<E> {
+pub enum AddressOneTimeProgramError<E> {
     /// `new_address` differs from `old_address` in bits 0–1 (set by pins A1/A2, not OTP).
     HardwareBitsDiffer { old: u8, new: u8 },
     /// 7-bit addresses must have bit 7 clear.
@@ -78,17 +77,17 @@ pub enum ProgramError<E> {
     /// `old_address == new_address` — nothing to program.
     OldNewAddressesIdentical,
     I2cPreVerify(E),
-    I2cWriteStep1(E),
-    I2cWriteStep2(E),
-    I2cWriteStep3(E),
-    I2cWriteStep4(E),
+    I2cWriteOtpAddressByte(E),
+    I2cEnableProgrammingMode(E),
+    I2cBurn(E),
+    I2cDisableProgrammingMode(E),
     I2cPostVerify(E),
 }
 
 /// Errors from the OTP zero-position programming sequence.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ZeroPositionError<E> {
+pub enum ZeroPositionOneTimeProgramError<E> {
     /// Failed to clear the zero-position registers (step 1).
     I2cClear(E),
     /// Failed to read the angle (steps 2, 6, 8).
@@ -101,19 +100,6 @@ pub enum ZeroPositionError<E> {
     I2cBurn(E),
     /// Failed to set Verify (step 7).
     I2cVerify(E),
-}
-
-/// Diagnostic angle readings returned by [`As5048b::program_zero_position`].
-///
-/// The datasheet says both readings should be 0 after a successful burn; the
-/// driver returns the actual values so the caller can log or threshold them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct ZeroPositionResult {
-    /// Raw angle read after the burn step (datasheet expects 0).
-    pub post_burn_angle_raw: u16,
-    /// Raw angle read after the verify-reload step (datasheet expects 0).
-    pub post_verify_angle_raw: u16,
 }
 
 /// AS5048B driver bound to a single 7-bit I²C address.
@@ -164,7 +150,7 @@ where
         Ok(Diagnostics { raw: b[0] })
     }
 
-    /// Assign a new 7-bit I²C with a One-Time-Program (OTP). **Irreversible.**
+    /// Assign a new 7-bit I²C address with a One-Time-Program (OTP). **Irreversible.**
     ///
     /// On success, `self.address()` returns `new_address`. After step 1 the
     /// chip already responds on `new_address`, so on later-step failure the
@@ -175,11 +161,11 @@ where
         &mut self,
         delay: &mut D,
         new_address: u8,
-    ) -> Result<(), ProgramError<E>> {
+    ) -> Result<(), AddressOneTimeProgramError<E>> {
         validate_new_address(self.address, new_address)?;
 
         // Pre-verify the old address responds.
-        self.read_angle_raw().map_err(ProgramError::I2cPreVerify)?;
+        self.read_angle_raw().map_err(AddressOneTimeProgramError::I2cPreVerify)?;
 
         let otp_data = otp_five_bits_for_7bit_address(new_address);
         let old_address = self.address;
@@ -187,7 +173,7 @@ where
         // 1. Load new address into 0x15 while still talking to old_address.
         self.i2c
             .write(old_address, &[REG_I2C_ADDRESS, otp_data])
-            .map_err(ProgramError::I2cWriteStep1)?;
+            .map_err(AddressOneTimeProgramError::I2cWriteOtpAddressByte)?;
         delay.delay_ms(2);
 
         // From here on, the chip listens on new_address.
@@ -195,24 +181,24 @@ where
 
         // 2. Enable programming mode.
         self.i2c
-            .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_PROGRAMMING_MODE])
-            .map_err(ProgramError::I2cWriteStep2)?;
+            .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_ADDRESS_PROGRAMMING_MODE])
+            .map_err(AddressOneTimeProgramError::I2cEnableProgrammingMode)?;
         delay.delay_ms(2);
 
         // 3. Burn the fuse.
         self.i2c
             .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN])
-            .map_err(ProgramError::I2cWriteStep3)?;
+            .map_err(AddressOneTimeProgramError::I2cBurn)?;
         delay.delay_ms(30);
 
         // 4. Exit programming mode.
         self.i2c
             .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_DISABLE])
-            .map_err(ProgramError::I2cWriteStep4)?;
+            .map_err(AddressOneTimeProgramError::I2cDisableProgrammingMode)?;
         delay.delay_ms(2);
 
         // Post-verify on the new address.
-        self.read_angle_raw().map_err(ProgramError::I2cPostVerify)?;
+        self.read_angle_raw().map_err(AddressOneTimeProgramError::I2cPostVerify)?;
         Ok(())
     }
 
@@ -222,27 +208,24 @@ where
     /// clear `0x16`/`0x17`, read the live (uncorrected) angle, write it back as
     /// the zero offset, then Programming Enable → Burn → Verify reload. Place
     /// the magnet at the desired mechanical zero before calling.
-    ///
-    /// On success the post-burn and post-verify angle readings are returned.
-    /// The datasheet expects both to read 0; threshold or log them as needed.
     pub fn program_zero_position<D: DelayNs>(
         &mut self,
         delay: &mut D,
-    ) -> Result<ZeroPositionResult, ZeroPositionError<E>> {
+    ) -> Result<(), ZeroPositionOneTimeProgramError<E>> {
         // 1. Clear the zero-position registers so the next angle read is uncorrected.
         self.i2c
             .write(self.address, &[REG_OTP_ZERO_HI, 0x00])
-            .map_err(ZeroPositionError::I2cClear)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cClear)?;
         delay.delay_ms(2);
         self.i2c
             .write(self.address, &[REG_OTP_ZERO_LO, 0x00])
-            .map_err(ZeroPositionError::I2cClear)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cClear)?;
         delay.delay_ms(2);
 
         // 2. Read the live angle (no zero correction now applied).
         let angle = self
             .read_angle_raw()
-            .map_err(ZeroPositionError::I2cReadAngle)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cReadAngle)?;
 
         // 3. Write the live angle into the zero-position registers. Encoding
         //    matches the angle-read decoding in `read_u14`: hi = bits 13..6,
@@ -251,45 +234,40 @@ where
         let lo = (angle & 0x3F) as u8;
         self.i2c
             .write(self.address, &[REG_OTP_ZERO_HI, hi])
-            .map_err(ZeroPositionError::I2cWriteZeroPosition)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cWriteZeroPosition)?;
         delay.delay_ms(2);
         self.i2c
             .write(self.address, &[REG_OTP_ZERO_LO, lo])
-            .map_err(ZeroPositionError::I2cWriteZeroPosition)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cWriteZeroPosition)?;
         delay.delay_ms(2);
 
         // 4. Programming Enable.
         self.i2c
             .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_PROG_ENABLE])
-            .map_err(ZeroPositionError::I2cProgrammingEnable)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cProgrammingEnable)?;
         delay.delay_ms(2);
 
         // 5. Burn.
         self.i2c
             .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN])
-            .map_err(ZeroPositionError::I2cBurn)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cBurn)?;
         delay.delay_ms(30);
 
-        // 6. Read angle (datasheet expects 0).
-        let post_burn_angle_raw = self
-            .read_angle_raw()
-            .map_err(ZeroPositionError::I2cReadAngle)?;
+        // 6. Read angle (datasheet expects 0; discarded — liveness check only).
+        self.read_angle_raw()
+            .map_err(ZeroPositionOneTimeProgramError::I2cReadAngle)?;
 
         // 7. Verify — reload OTP into internal registers.
         self.i2c
             .write(self.address, &[REG_PROGRAMMING_CONTROL, OTP_CTRL_VERIFY])
-            .map_err(ZeroPositionError::I2cVerify)?;
+            .map_err(ZeroPositionOneTimeProgramError::I2cVerify)?;
         delay.delay_ms(2);
 
-        // 8. Read angle (datasheet expects 0).
-        let post_verify_angle_raw = self
-            .read_angle_raw()
-            .map_err(ZeroPositionError::I2cReadAngle)?;
+        // 8. Read angle (datasheet expects 0; discarded — liveness check only).
+        self.read_angle_raw()
+            .map_err(ZeroPositionOneTimeProgramError::I2cReadAngle)?;
 
-        Ok(ZeroPositionResult {
-            post_burn_angle_raw,
-            post_verify_angle_raw,
-        })
+        Ok(())
     }
 }
 
@@ -305,18 +283,18 @@ fn otp_five_bits_for_7bit_address(addr_7: u8) -> u8 {
     ((addr_7 >> 2) ^ 0x10) & 0x1F
 }
 
-fn validate_new_address<E>(old: u8, new: u8) -> Result<(), ProgramError<E>> {
+fn validate_new_address<E>(old: u8, new: u8) -> Result<(), AddressOneTimeProgramError<E>> {
     if old == new {
-        return Err(ProgramError::OldNewAddressesIdentical);
+        return Err(AddressOneTimeProgramError::OldNewAddressesIdentical);
     }
     if new & 0x80 != 0 {
-        return Err(ProgramError::AddressOutOf7BitRange(new));
+        return Err(AddressOneTimeProgramError::AddressOutOf7BitRange(new));
     }
     if new < 0x08 {
-        return Err(ProgramError::AddressReserved);
+        return Err(AddressOneTimeProgramError::AddressReserved);
     }
     if (old & 0x03) != (new & 0x03) {
-        return Err(ProgramError::HardwareBitsDiffer { old, new });
+        return Err(AddressOneTimeProgramError::HardwareBitsDiffer { old, new });
     }
     Ok(())
 }
@@ -354,20 +332,20 @@ mod tests {
     fn validate_new_address_rejects_invalid() {
         assert_eq!(
             validate_new_address::<()>(0x40, 0x40),
-            Err(ProgramError::OldNewAddressesIdentical)
+            Err(AddressOneTimeProgramError::OldNewAddressesIdentical)
         );
         assert_eq!(
             validate_new_address::<()>(0x40, 0x80),
-            Err(ProgramError::AddressOutOf7BitRange(0x80))
+            Err(AddressOneTimeProgramError::AddressOutOf7BitRange(0x80))
         );
         assert_eq!(
             validate_new_address::<()>(0x40, 0x05),
-            Err(ProgramError::AddressReserved)
+            Err(AddressOneTimeProgramError::AddressReserved)
         );
         // Bits 0–1 differ -> A1/A2 strapping mismatch.
         assert_eq!(
             validate_new_address::<()>(0x40, 0x45),
-            Err(ProgramError::HardwareBitsDiffer { old: 0x40, new: 0x45 })
+            Err(AddressOneTimeProgramError::HardwareBitsDiffer { old: 0x40, new: 0x45 })
         );
         assert_eq!(validate_new_address::<()>(0x40, 0x44), Ok(()));
     }
@@ -477,7 +455,7 @@ mod tests {
             // Step 1: write OTP byte to 0x15 on old address.
             Transaction::write(old, vec![REG_I2C_ADDRESS, otp]),
             // Step 2: enable programming mode on new address.
-            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_PROGRAMMING_MODE]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_ADDRESS_PROGRAMMING_MODE]),
             // Step 3: burn.
             Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN]),
             // Step 4: exit programming.
@@ -531,16 +509,14 @@ mod tests {
         let mut delay = NoopDelay::new();
         let mut dev = As5048b::new(&mut i2c, DEFAULT_ADDRESS);
 
-        let result = dev.program_zero_position(&mut delay).unwrap();
-        assert_eq!(result.post_burn_angle_raw, 0);
-        assert_eq!(result.post_verify_angle_raw, 0);
+        dev.program_zero_position(&mut delay).unwrap();
         i2c.done();
     }
 
     #[test]
-    fn program_zero_position_returns_nonzero_post_readings() {
+    fn program_zero_position_succeeds_when_post_readings_nonzero() {
         // If the magnet drifts during burn, post readings won't be exactly 0.
-        // The driver should surface them, not error.
+        // The driver does not treat this as an error — it just discards them.
         let expectations = [
             Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_HI, 0x00]),
             Transaction::write(DEFAULT_ADDRESS, vec![REG_OTP_ZERO_LO, 0x00]),
@@ -563,9 +539,7 @@ mod tests {
         let mut delay = NoopDelay::new();
         let mut dev = As5048b::new(&mut i2c, DEFAULT_ADDRESS);
 
-        let result = dev.program_zero_position(&mut delay).unwrap();
-        assert_eq!(result.post_burn_angle_raw, 2);
-        assert_eq!(result.post_verify_angle_raw, 3);
+        dev.program_zero_position(&mut delay).unwrap();
         i2c.done();
     }
 
@@ -577,7 +551,7 @@ mod tests {
 
         // Bit-0/1 mismatch — caught before any I²C traffic.
         let err = dev.program_i2c_address(&mut delay, 0x45).unwrap_err();
-        assert_eq!(err, ProgramError::HardwareBitsDiffer { old: 0x40, new: 0x45 });
+        assert_eq!(err, AddressOneTimeProgramError::HardwareBitsDiffer { old: 0x40, new: 0x45 });
         assert_eq!(dev.address(), 0x40);
         i2c.done();
     }
