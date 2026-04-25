@@ -18,7 +18,7 @@ const REG_DIAGNOSTICS: u8 = 0xFB;
 const REG_MAGNITUDE_MSB: u8 = 0xFC;
 const REG_ANGLE_MSB: u8 = 0xFE;
 
-// Programming-control bits
+// One-Time-Program (OTP) programming-control bits
 const OTP_CTRL_PROG_ENABLE: u8 = 0x01; // bit 0
 const OTP_CTRL_BURN: u8 = 0x08; // bit 3
 const OTP_CTRL_VERIFY: u8 = 0x40; // bit 6
