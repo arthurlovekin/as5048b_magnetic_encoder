@@ -12,8 +12,19 @@ path = "./src/bin/simple.rs"
 name = "two_sensors_full_read"
 path = "./src/bin/two_sensors_full_read.rs"
 
+[[bin]]
+name = "program_address"
+path = "./src/bin/program_address.rs"
+
 [dependencies]
 esp-hal = { version = "~1.0", features = ["defmt", "esp32c6", "unstable"] }
+
+# Onboard WS2812 RGB LED, used by the `program` example to turn solid red as a
+# "this firmware is flashed" indicator. The chip is selected through esp-hal's
+# esp32c6 feature via feature unification, so esp-hal-smartled's own chip
+# features are intentionally left off.
+esp-hal-smartled = "0.17.0"
+smart-leds       = "0.4"
 
 defmt                  = "1.0.1"
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c6"] }
