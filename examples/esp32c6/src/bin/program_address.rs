@@ -10,10 +10,9 @@
 //! One-time program a new I²C address into an AS5048B.
 //!
 //! **Irreversible.** This runs the OTP address-programming sequence
-//! ([`As5048b::program_i2c_address`]) exactly once, then turns the onboard
-//! WS2812 RGB LED (GPIO8) solid red and idles — the red LED is just a visual
-//! marker so you can tell at a glance that *this* firmware (not one of the
-//! read-only examples) is the one flashed on the board.
+//! ([`As5048b::program_i2c_address`]) exactly once, then idles in a confirmation
+//! loop reading the angle. The onboard WS2812 RGB LED (GPIO8) shows status:
+//! blue while reads succeed, red on a failed read (e.g. no chip present).
 //!
 //! Edit [`I2C_ADDR_OLD`] / [`I2C_ADDR_NEW`] to match your wiring and the address
 //! you want burned in. `NEW` must agree with `OLD` in bits 0–1, since those come
@@ -27,7 +26,7 @@ use esp_hal::main;
 use esp_hal::rmt::Rmt;
 use esp_hal::time::{Duration, Rate};
 use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
-use smart_leds::{RGB8, SmartLedsWrite, brightness, gamma};
+use smart_leds::{RGB8, SmartLedsWrite};
 use {esp_backtrace as _, esp_println as _};
 
 use as5048b_magnetic_encoder::As5048b;
@@ -39,7 +38,7 @@ const I2C_ADDR_OLD: u8 = 0x43;
 // Address to burn in. Must share bits 0–1 with `OLD` (A1/A2 pins).
 // with A1=A2=low (default: 0x40):  0x44, 0x48, 0x4C, 0x50, 0x54, 0x58 ...
 // With A1=A2=high (default: 0x43): 0x47, 0x4B, 0x4F, 0x53, 0x57, 0x5B ...
-const I2C_ADDR_NEW: u8 = 0x4B;
+const I2C_ADDR_NEW: u8 = 0x5F;
 
 #[allow(
     clippy::large_stack_frames,
@@ -54,10 +53,11 @@ fn main() -> ! {
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
     let mut rmt_buffer = smart_led_buffer!(1);
     let mut led = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, &mut rmt_buffer);
-    let red = RGB8 { r: 255, g: 0, b: 0 };
-    let bright = 1; // 0-255
-    led.write(brightness(gamma([red].into_iter()), bright))
-        .expect("LED write");
+    // Blue = nominal, red = error. Start red until the first good read.
+    let blue = RGB8 { r: 0, g: 0, b: 16 };
+    let red = RGB8 { r: 16, g: 0, b: 0 };
+    let mut set_led = |color: RGB8| led.write([color].into_iter()).expect("LED write");
+    set_led(red);
 
     //////// I2C master ////////
     // A bounded hardware BusTimeout plus a software SoftwareTimeout so a missing
@@ -88,12 +88,18 @@ fn main() -> ! {
     }
 
     // Confirm everything works: read the angle on the (new) address each second.
-    // The LED stays red the whole time so the board state remains obvious.
+    // LED is blue while reads succeed, red if a read fails (e.g. no chip present).
     loop {
         let addr = dev.address();
         match dev.read_angle_degrees() {
-            Ok(degrees) => info!("addr=0x{:02x}: angle={} deg", addr, degrees),
-            Err(e) => defmt::warn!("addr=0x{:02x}: angle read failed: {}", addr, e),
+            Ok(degrees) => {
+                set_led(blue);
+                info!("addr=0x{:02x}: angle={} deg", addr, degrees);
+            }
+            Err(e) => {
+                set_led(red);
+                defmt::warn!("addr=0x{:02x}: angle read failed: {}", addr, e);
+            }
         }
         delay.delay_millis(1000);
     }
