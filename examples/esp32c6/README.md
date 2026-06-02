@@ -42,7 +42,8 @@ The 7-bit I²C address is set by the AS5048B's A1/A2 pins:
 
 Reads the angle in degrees from one AS5048B at `0x40` (A1=A2=GND) every 200 ms.
 
-```sh
+```bash
+cd examples/esp32c6
 cargo run --release --bin simple
 ```
 
@@ -50,7 +51,7 @@ cargo run --release --bin simple
 
 Reads diagnostics, raw magnitude, and angle (degrees) from two AS5048B sensors sharing the same I²C bus. Sensor A is at `0x40` (A1=A2=GND) and sensor B is at `0x41` (A1=VDD, A2=GND). The bus is shared between the two driver instances via `embedded_hal_bus::i2c::RefCellDevice`.
 
-```sh
+```bash
 cargo run --release --bin two_sensors_full_read
 ```
 
