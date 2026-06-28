@@ -1,17 +1,18 @@
 # AS5048B Magnetic Encoder
-This is a driver library for the AS5048B magnetic rotary encoder.
+This is a driver library for the AS5048B, a 14-bit magnetic rotary position sensor produced by AMS OSRAM. This library only supports the I2C interface.
 
 ## Features
-- Read the angle
-- Read the magnitude of the CORDIC algorithm
-- Read diagnostics: offest compensation finished, cordic overflow, magnetic field too strong, magnetic field too weak
-- One-Time-Program the I2C address (minimal testing completed on real hardware)
-- One-Time-Program the zero position (untested on real hardware)
+- [x] Read the angle (raw 14-bit and degrees)
+- [x] Read the magnitude of the CORDIC algorithm
+- [x] Read diagnostics: offset compensation finished, cordic overflow, magnetic field too strong, magnetic field too weak
+- [x] One-Time-Program the I2C address
+- [x] One-Time-Program the zero position
+- [x] `defmt` support (optional `defmt` feature)
+- [x] tested with examples on ESP32-C6 DevKitC microcontroller
 
 ## Development
 The relevant parts of the datasheet are summarized in the [datasheet_i2c.md](datasheet_i2c.md) file.
 
 ## TODO
-- Add examples that comprehensively cover all features:
-    - One-Time-Program the I2C address of one sensor
+- Add example and tests for:
     - One-Time-Program the zero position of one sensor
