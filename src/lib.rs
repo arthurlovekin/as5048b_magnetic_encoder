@@ -2,9 +2,28 @@
 
 //! Driver for the AMS AS5048B magnetic rotary encoder over I²C.
 //!
-//! Built on top of the [`embedded-hal`] v1.0 traits so it works with any HAL
-//! that provides [`embedded_hal::i2c::I2c`] and [`embedded_hal::delay::DelayNs`].
-//! See `datasheet_i2c.md` for the parts of the datasheet this driver relies on.
+//! Built on top of the [`embedded-hal`](https://docs.rs/embedded-hal) v1.0
+//! traits so it works with any HAL that provides [`embedded_hal::i2c::I2c`] and
+//! [`embedded_hal::delay::DelayNs`]. See `datasheet_i2c.md` for the parts of the
+//! datasheet this driver relies on.
+//!
+//! # Example
+//!
+//! ```
+//! use as5048b_magnetic_encoder::{As5048b, DEFAULT_ADDRESS};
+//! use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction};
+//!
+//! // The driver reads the 14-bit angle from register 0xFE/0xFF in one
+//! // write-read transaction; here we stand in a mock bus for the device.
+//! let expectations = [Transaction::write_read(DEFAULT_ADDRESS, vec![0xFE], vec![0xAA, 0x15])];
+//! let mut i2c = I2cMock::new(&expectations);
+//!
+//! let mut encoder = As5048b::new(&mut i2c, DEFAULT_ADDRESS);
+//! let degrees = encoder.read_angle_degrees().unwrap();
+//! assert!((0.0..360.0).contains(&degrees));
+//!
+//! i2c.done();
+//! ```
 
 use embedded_hal::delay::DelayNs;
 use embedded_hal::i2c::I2c;
@@ -84,6 +103,51 @@ pub enum AddressOneTimeProgramError<E> {
     I2cPostVerify(E),
 }
 
+impl<E: core::fmt::Display> core::fmt::Display for AddressOneTimeProgramError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use AddressOneTimeProgramError::*;
+        match self {
+            HardwareBitsDiffer { old, new } => write!(
+                f,
+                "new address {new:#04x} differs from current address {old:#04x} in pin-strapped bits 0-1"
+            ),
+            AddressOutOf7BitRange(a) => {
+                write!(f, "address {a:#04x} is out of 7-bit range (bit 7 set)")
+            }
+            AddressReserved => write!(f, "address is in the reserved I²C range 0x00..=0x07"),
+            OldNewAddressesIdentical => {
+                write!(f, "new address equals the current address; nothing to program")
+            }
+            I2cPreVerify(e) => write!(f, "I²C error pre-verifying the old address: {e}"),
+            I2cWriteOtpAddressByte(e) => write!(f, "I²C error writing the OTP address byte: {e}"),
+            I2cEnableProgrammingMode(e) => write!(f, "I²C error enabling programming mode: {e}"),
+            I2cBurn(e) => write!(f, "I²C error burning the address fuse: {e}"),
+            I2cDisableProgrammingMode(e) => {
+                write!(f, "I²C error disabling programming mode: {e}")
+            }
+            I2cPostVerify(e) => write!(f, "I²C error post-verifying the new address: {e}"),
+        }
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for AddressOneTimeProgramError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        use AddressOneTimeProgramError::*;
+        match self {
+            I2cPreVerify(e)
+            | I2cWriteOtpAddressByte(e)
+            | I2cEnableProgrammingMode(e)
+            | I2cBurn(e)
+            | I2cDisableProgrammingMode(e)
+            | I2cPostVerify(e) => Some(e),
+            HardwareBitsDiffer { .. }
+            | AddressOutOf7BitRange(_)
+            | AddressReserved
+            | OldNewAddressesIdentical => None,
+        }
+    }
+}
+
 /// Errors from the OTP zero-position programming sequence.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -102,7 +166,38 @@ pub enum ZeroPositionOneTimeProgramError<E> {
     I2cVerify(E),
 }
 
+impl<E: core::fmt::Display> core::fmt::Display for ZeroPositionOneTimeProgramError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use ZeroPositionOneTimeProgramError::*;
+        match self {
+            I2cClear(e) => write!(f, "I²C error clearing the zero-position registers: {e}"),
+            I2cReadAngle(e) => write!(f, "I²C error reading the angle: {e}"),
+            I2cWriteZeroPosition(e) => {
+                write!(f, "I²C error writing the zero-position registers: {e}")
+            }
+            I2cProgrammingEnable(e) => write!(f, "I²C error setting Programming Enable: {e}"),
+            I2cBurn(e) => write!(f, "I²C error burning the zero-position fuse: {e}"),
+            I2cVerify(e) => write!(f, "I²C error during the Verify reload: {e}"),
+        }
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for ZeroPositionOneTimeProgramError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        use ZeroPositionOneTimeProgramError::*;
+        match self {
+            I2cClear(e)
+            | I2cReadAngle(e)
+            | I2cWriteZeroPosition(e)
+            | I2cProgrammingEnable(e)
+            | I2cBurn(e)
+            | I2cVerify(e) => Some(e),
+        }
+    }
+}
+
 /// AS5048B driver bound to a single 7-bit I²C address.
+#[derive(Debug)]
 pub struct As5048b<I2C> {
     i2c: I2C,
     address: u8,
@@ -128,21 +223,33 @@ where
     }
 
     /// Raw 14-bit angle (`0..=16_383`) from registers `0xFE`/`0xFF`.
+    ///
+    /// # Errors
+    /// Returns the underlying I²C bus error if the write-read transaction fails.
     pub fn read_angle_raw(&mut self) -> Result<u16, E> {
         read_u14(&mut self.i2c, self.address, REG_ANGLE_MSB)
     }
 
     /// Angle in degrees, `0.0..360.0`.
+    ///
+    /// # Errors
+    /// Returns the underlying I²C bus error if reading the angle register fails.
     pub fn read_angle_degrees(&mut self) -> Result<f32, E> {
         Ok(raw_to_degrees(self.read_angle_raw()?))
     }
 
     /// Raw 14-bit CORDIC magnitude from registers `0xFC`/`0xFD`.
+    ///
+    /// # Errors
+    /// Returns the underlying I²C bus error if the write-read transaction fails.
     pub fn read_magnitude_raw(&mut self) -> Result<u16, E> {
         read_u14(&mut self.i2c, self.address, REG_MAGNITUDE_MSB)
     }
 
     /// Diagnostic byte from register `0xFB`.
+    ///
+    /// # Errors
+    /// Returns the underlying I²C bus error if the write-read transaction fails.
     pub fn read_diagnostics(&mut self) -> Result<Diagnostics, E> {
         let mut b = [0u8; 1];
         self.i2c
