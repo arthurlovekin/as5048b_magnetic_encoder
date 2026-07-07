@@ -87,8 +87,10 @@ fn main() -> ! {
                 let _ = write!(line, "{} degrees {}\r\n", loop_count, degrees);
                 let _ = serial.write(line.as_bytes());
             }
-            Err(_) => {
-                let _ = serial.write(b"AS5048B I2C read failed\r\n");
+            Err(e) => {
+                let mut line = String::<96>::new();
+                let _ = write!(line, "AS5048B I2C read failed: {:?}\r\n", e);
+                let _ = serial.write(line.as_bytes());
             }
         }
 
