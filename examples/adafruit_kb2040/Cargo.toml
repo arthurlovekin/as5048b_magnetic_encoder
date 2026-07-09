@@ -7,6 +7,10 @@ edition = "2024"
 name = "simple"
 path = "src/simple.rs"
 
+[[bin]]
+name = "program_zero_position"
+path = "src/program_zero_position.rs"
+
 [dependencies]
 cortex-m-rt = { version = "0.7.3", optional = true }
 embedded-hal = "1.0.0"
