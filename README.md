@@ -12,7 +12,3 @@ This is a driver library for the AS5048B, a 14-bit magnetic rotary position sens
 
 ## Development
 The relevant parts of the datasheet are summarized in the [datasheet_i2c.md](datasheet_i2c.md) file.
-
-## TODO
-- Add example and tests for:
-    - One-Time-Program the zero position of one sensor
