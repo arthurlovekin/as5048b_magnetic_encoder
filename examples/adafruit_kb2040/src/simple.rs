@@ -83,12 +83,14 @@ fn main() -> ! {
 
         match sensor.read_angle_degrees() {
             Ok(degrees) => {
-                let mut line = String::<64>::new();
+                let mut line = String::<128>::new();
                 let _ = write!(line, "{} degrees {}\r\n", loop_count, degrees);
                 let _ = serial.write(line.as_bytes());
             }
-            Err(_) => {
-                let _ = serial.write(b"AS5048B I2C read failed\r\n");
+            Err(e) => {
+                let mut line = String::<128>::new();
+                let _ = write!(line, "AS5048B I2C read failed: {:?}\r\n", e);
+                let _ = serial.write(line.as_bytes());
             }
         }
 
