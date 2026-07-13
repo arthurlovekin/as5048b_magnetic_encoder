@@ -95,6 +95,9 @@ pub enum AddressOneTimeProgramError<E> {
     AddressReserved,
     /// `old_address == new_address` — nothing to program.
     OldNewAddressesIdentical,
+    /// The chip is not at its factory-default address, so it was probably
+    /// already OTP-programmed. Use `force_program_i2c_address` to burn anyway.
+    AlreadyProgrammed { current: u8, unflashed: u8 },
     I2cPreVerify(E),
     I2cWriteOtpAddressByte(E),
     I2cEnableProgrammingMode(E),
@@ -118,6 +121,10 @@ impl<E: core::fmt::Display> core::fmt::Display for AddressOneTimeProgramError<E>
             OldNewAddressesIdentical => {
                 write!(f, "new address equals the current address; nothing to program")
             }
+            AlreadyProgrammed { current, unflashed } => write!(
+                f,
+                "chip at {current:#04x} is not at its unflashed address {unflashed:#04x}; it appears already programmed (use force_program_i2c_address to override)"
+            ),
             I2cPreVerify(e) => write!(f, "I²C error pre-verifying the old address: {e}"),
             I2cWriteOtpAddressByte(e) => write!(f, "I²C error writing the OTP address byte: {e}"),
             I2cEnableProgrammingMode(e) => write!(f, "I²C error enabling programming mode: {e}"),
@@ -143,7 +150,8 @@ impl<E: core::error::Error + 'static> core::error::Error for AddressOneTimeProgr
             HardwareBitsDiffer { .. }
             | AddressOutOf7BitRange(_)
             | AddressReserved
-            | OldNewAddressesIdentical => None,
+            | OldNewAddressesIdentical
+            | AlreadyProgrammed { .. } => None,
         }
     }
 }
@@ -259,12 +267,38 @@ where
 
     /// Assign a new 7-bit I²C address with a One-Time-Program (OTP). **Irreversible.**
     ///
+    /// Raises a [`AddressOneTimeProgramError::AlreadyProgrammed`] error if the 
+    /// chip is not at its factory-default address (`0x40 | (A1/A2 pins)`). To 
+    /// burn a chip that is already programmed, use [`Self::force_program_i2c_address`]
+    ///
     /// On success, `self.address()` returns `new_address`. After step 1 the
     /// chip already responds on `new_address`, so on later-step failure the
     /// driver is left bound to `new_address` for diagnostic reads.
     /// `new_address` must agree with the current address in bits 0–1 (those
     /// are pin-strapped via A1/A2 and cannot be changed by OTP).
     pub fn program_i2c_address<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+        new_address: u8,
+    ) -> Result<(), AddressOneTimeProgramError<E>> {
+        let unflashed = unflashed_address(self.address);
+        if self.address != unflashed {
+            return Err(AddressOneTimeProgramError::AlreadyProgrammed {
+                current: self.address,
+                unflashed,
+            });
+        }
+        self.force_program_i2c_address(delay, new_address)
+    }
+
+    /// Like [`Self::program_i2c_address`] but **without** the factory-default
+    /// address guard. **Irreversible.**
+    ///
+    /// Use this only for intentionally burninging a new address
+    /// into a chip that has already been OTP-programmed. The resulting address
+    /// is the bitwise OR of the old and new OTP bits, not simply `new_address`
+    /// — the datasheet's OTP fuse cannot be cleared. 
+    pub fn force_program_i2c_address<D: DelayNs>(
         &mut self,
         delay: &mut D,
         new_address: u8,
@@ -388,6 +422,12 @@ pub fn raw_to_degrees(raw: u16) -> f32 {
 /// bits 0–1 come from pins A1/A2 and are ignored here).
 fn otp_five_bits_for_7bit_address(addr_7: u8) -> u8 {
     ((addr_7 >> 2) ^ 0x10) & 0x1F
+}
+
+/// The factory-default (unprogrammed) 7-bit address for a chip whose A1/A2 pins
+/// match `address` in bits 0–1. OTP bits 2–6 are zero at the default (0x40 base).
+const fn unflashed_address(address: u8) -> u8 {
+    0x40 | (address & 0x03)
 }
 
 fn validate_new_address<E>(old: u8, new: u8) -> Result<(), AddressOneTimeProgramError<E>> {
@@ -660,6 +700,80 @@ mod tests {
         let err = dev.program_i2c_address(&mut delay, 0x45).unwrap_err();
         assert_eq!(err, AddressOneTimeProgramError::HardwareBitsDiffer { old: 0x40, new: 0x45 });
         assert_eq!(dev.address(), 0x40);
+        i2c.done();
+    }
+
+    #[test]
+    fn unflashed_address_maps_pin_strapping() {
+        assert_eq!(unflashed_address(0x40), 0x40); // A1/A2 low, unflashed
+        assert_eq!(unflashed_address(0x43), 0x43); // A1/A2 high, unflashed
+        assert_eq!(unflashed_address(0x44), 0x40); // flashed, low strapping
+        assert_eq!(unflashed_address(0x5F), 0x43); // flashed, high strapping
+    }
+
+    #[test]
+    fn program_i2c_address_refuses_when_already_flashed() {
+        // Chip already programmed to 0x44 (A1/A2 low). A second program to 0x48
+        // must be refused before touching the bus.
+        let mut i2c = I2cMock::new(&[]);
+        let mut delay = NoopDelay::new();
+        let mut dev = As5048b::new(&mut i2c, 0x44);
+
+        let err = dev.program_i2c_address(&mut delay, 0x48).unwrap_err();
+        assert_eq!(
+            err,
+            AddressOneTimeProgramError::AlreadyProgrammed { current: 0x44, unflashed: 0x40 }
+        );
+        assert_eq!(dev.address(), 0x44); // unchanged
+        i2c.done();
+    }
+
+    #[test]
+    fn program_i2c_address_allows_unflashed_high_strapping() {
+        // A1/A2 strapped high -> unflashed address 0x43, which is allowed.
+        let old = 0x43;
+        let new = 0x47; // shares low 2 bits (11) with 0x43
+        let otp = otp_five_bits_for_7bit_address(new);
+
+        let expectations = [
+            Transaction::write_read(old, vec![REG_ANGLE_MSB], vec![0x00, 0x00]),
+            Transaction::write(old, vec![REG_I2C_ADDRESS, otp]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_ADDRESS_PROGRAMMING_MODE]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_DISABLE]),
+            Transaction::write_read(new, vec![REG_ANGLE_MSB], vec![0x00, 0x00]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+        let mut delay = NoopDelay::new();
+        let mut dev = As5048b::new(&mut i2c, old);
+
+        dev.program_i2c_address(&mut delay, new).unwrap();
+        assert_eq!(dev.address(), new);
+        i2c.done();
+    }
+
+    #[test]
+    fn force_program_i2c_address_allows_double_program() {
+        // Intentional double-program: chip already at 0x44, force-burn to 0x48.
+        // The guard is skipped and the full OTP sequence runs.
+        let old = 0x44;
+        let new = 0x48; // shares low 2 bits (00) with 0x44
+        let otp = otp_five_bits_for_7bit_address(new);
+
+        let expectations = [
+            Transaction::write_read(old, vec![REG_ANGLE_MSB], vec![0x00, 0x00]),
+            Transaction::write(old, vec![REG_I2C_ADDRESS, otp]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_ADDRESS_PROGRAMMING_MODE]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_BURN]),
+            Transaction::write(new, vec![REG_PROGRAMMING_CONTROL, OTP_CTRL_DISABLE]),
+            Transaction::write_read(new, vec![REG_ANGLE_MSB], vec![0x00, 0x00]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+        let mut delay = NoopDelay::new();
+        let mut dev = As5048b::new(&mut i2c, old);
+
+        dev.force_program_i2c_address(&mut delay, new).unwrap();
+        assert_eq!(dev.address(), new);
         i2c.done();
     }
 }
