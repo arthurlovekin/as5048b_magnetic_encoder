@@ -9,6 +9,9 @@ repository = "https://github.com/arthurlovekin/as5048b_magnetic_encoder"
 readme = "README.md"
 keywords = ["embedded-hal", "i2c", "encoder", "as5048b", "no-std"]
 categories = ["embedded", "no-std", "hardware-support"]
+exclude = [
+    "datasheet_i2c.md",
+]
 
 [dependencies]
 embedded-hal = "1.0"
